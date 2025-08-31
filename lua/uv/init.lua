@@ -404,10 +404,13 @@ end
 
 -- Run current file
 -- Helpers: floating window + streaming appender
-local function _open_float(title, opts)
+local M = M or {}
+
+-- ========= float helpers =========
+local function open_float(title, opts)
   opts = opts or {}
-  local width  = opts.width or math.floor(vim.o.columns * 0.8)
-  local height = opts.height or math.floor(vim.o.lines * 0.6)
+  local width  = opts.width  or math.floor(vim.o.columns * 0.8)
+  local height = opts.height or math.floor(vim.o.lines   * 0.6)
   local row    = math.floor((vim.o.lines - height) / 2 - 1)
   local col    = math.floor((vim.o.columns - width) / 2)
 
@@ -416,48 +419,34 @@ local function _open_float(title, opts)
   vim.api.nvim_set_option_value("filetype", "log", { buf = buf })
 
   local win = vim.api.nvim_open_win(buf, true, {
-    relative = "editor",
-    style = "minimal",
-    border = opts.border or "rounded",
-    title = title,
-    title_pos = "center",
-    width = width,
-    height = height,
-    row = row,
-    col = col,
-    noautocmd = true,
+    relative = "editor", style = "minimal", border = opts.border or "rounded",
+    title = title, title_pos = "center",
+    width = width, height = height, row = row, col = col, noautocmd = true,
   })
 
   vim.api.nvim_set_option_value("wrap", false, { win = win })
-  vim.api.nvim_set_option_value("cursorline", true, { win = win })
-
-  -- quick close
   for _, k in ipairs({ "q", "<Esc>" }) do
     vim.keymap.set("n", k, function()
       if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
     end, { buffer = buf, nowait = true, silent = true })
   end
-
-  return buf, win
+  return buf, win, width, height
 end
 
-local function _append(buf, ns, lines, hl)
-  if not lines or #lines == 0 then return end
+local function append(buf, ns, lines, hl)
+  if not lines then return end
   local filtered = {}
   for _, l in ipairs(lines) do
     if type(l) == "string" and l ~= "" then table.insert(filtered, l) end
   end
   if #filtered == 0 then return end
-
   local last = vim.api.nvim_buf_line_count(buf)
   vim.api.nvim_buf_set_lines(buf, last, last, false, filtered)
-
   if hl then
     for i = 0, #filtered - 1 do
       vim.api.nvim_buf_add_highlight(buf, ns, hl, last - 1 + i, 0, -1)
     end
   end
-
   local win = vim.fn.bufwinid(buf)
   if win ~= -1 then
     local lc = vim.api.nvim_buf_line_count(buf)
@@ -465,86 +454,50 @@ local function _append(buf, ns, lines, hl)
   end
 end
 
--- Build jobstart cmd from run_command config + file path
-local function _build_cmd(run_command, file)
+-- ========= image integration (image.nvim) =========
+local has_image, image = pcall(require, "image")
+local _img_handles_by_buf = {}
+
+local function render_image(buf, win, path, opts)
+  if not has_image then
+    append(buf, 0, { "[image marker] " .. path .. " (install 3rd/image.nvim to render)" }, "DiagnosticWarn")
+    return
+  end
+  if vim.fn.filereadable(path) ~= 1 then
+    append(buf, 0, { "[image missing] " .. path }, "DiagnosticError"); return
+  end
+
+  local ok, img = pcall(image.from_file, path, {
+    -- Tip: control size in character cells
+    -- desired_width = opts and opts.max_cols or nil,
+    -- desired_height = opts and opts.max_rows or nil,
+    with_virtual_padding = true,
+  })
+  if not ok then
+    append(buf, 0, { "[image error] " .. tostring(img) }, "DiagnosticError"); return
+  end
+
+  -- Reserve a blank line for the image and render at the end
+  local row = vim.api.nvim_buf_line_count(buf)
+  vim.api.nvim_buf_set_lines(buf, row, row, false, { "" })
+  img:render(row, 0, { buffer = buf })
+
+  _img_handles_by_buf[buf] = _img_handles_by_buf[buf] or {}
+  table.insert(_img_handles_by_buf[buf], img)
+end
+
+-- ========= command builder =========
+local function build_cmd(run_command, file)
   if type(run_command) == "table" then
     local cmd = vim.list_extend(vim.deepcopy(run_command), { file })
     return cmd
   end
-  -- string: use shell to preserve user’s quoting/aliases
   return { vim.o.shell, vim.o.shellcmdflag, run_command .. " " .. vim.fn.shellescape(file) }
 end
 
-function M.run_file_tmp(opts)
-  opts = opts or {}
-  local current_file = vim.fn.expand("%:p")
-  if not current_file or current_file == "" then
-    vim.notify("No file is open", vim.log.levels.WARN)
-    return
-  end
-  if not M.config or not M.config.execution or not M.config.execution.run_command then
-    vim.notify("Missing M.config.execution.run_command", vim.log.levels.ERROR)
-    return
-  end
-
-  local title_cmd
-  if type(M.config.execution.run_command) == "table" then
-    title_cmd = table.concat(M.config.execution.run_command, " ") .. " " .. vim.fn.fnamemodify(current_file, ":t")
-  else
-    title_cmd = M.config.execution.run_command .. " " .. vim.fn.fnamemodify(current_file, ":t")
-  end
-  local title = (" Run: %s "):format(title_cmd:sub(1, 90) .. (#title_cmd > 90 and " …" or ""))
-
-  local buf = _open_float(title, opts)
-  buf = select(1, buf) -- keep buffer id
-
-  local ns = vim.api.nvim_create_namespace("RunFileFloat")
-  local ok_hl   = (pcall(vim.api.nvim_get_hl, 0, { name = "DiagnosticOk" }) and "DiagnosticOk") or "DiffAdd"
-  local out_hl  = "DiagnosticInfo"
-  local err_hl  = "DiagnosticWarn"
-  local exit_hl = "DiagnosticError"
-
-  _append(buf, ns, { "▶ Running: " .. title_cmd, "" }, out_hl)
-
-  local cmd = _build_cmd(M.config.execution.run_command, current_file)
-  local timeout = M.config.execution.notification_timeout -- just reused if you want later
-
-  local job_id = vim.fn.jobstart(cmd, {
-    stdout_buffered = false,
-    stderr_buffered = false,
-    on_stdout = function(_, data)
-      _append(buf, ns, data, out_hl)
-    end,
-    on_stderr = function(_, data)
-      _append(buf, ns, data, err_hl)
-    end,
-    on_exit = function(_, code)
-      local msg
-      local hl
-      if code == 0 then
-        msg, hl = (""), ok_hl
-        _append(buf, ns, { "", "■ Program execution completed successfully (exit 0)" }, hl)
-      else
-        msg, hl = ("Program execution failed with exit code: " .. code), exit_hl
-        _append(buf, ns, { "", "■ " .. msg }, hl)
-      end
-      -- Optional: focus back to previous window when done
-      if opts.focus_on_exit == false then
-        vim.schedule(function() pcall(vim.cmd, "noautocmd wincmd p") end)
-      end
-    end,
-  })
-
-  if job_id <= 0 then
-    _append(buf, ns, { "Failed to start job." }, exit_hl)
-    return
-  end
-
-  return job_id
-end
-
+-- ========= main runner with image markers =========
 function M.run_file(opts)
- opts = opts or {}
+  opts = opts or {}
   local current_file = vim.fn.expand("%:p")
   if current_file == "" then
     vim.notify("No file is open", vim.log.levels.WARN); return
@@ -552,107 +505,59 @@ function M.run_file(opts)
   if not (M.config and M.config.execution and M.config.execution.run_command) then
     vim.notify("Missing M.config.execution.run_command", vim.log.levels.ERROR); return
   end
-  if not (vim.env.KITTY_PID or (vim.env.TERM or ""):match("kitty")) then
-    vim.notify("Not running inside Kitty; image rendering won’t work.", vim.log.levels.ERROR); return
-  end
 
-  local width  = opts.width  or math.floor(vim.o.columns * 0.8)
-  local height = opts.height or math.floor(vim.o.lines   * 0.6)
-  local row    = math.floor((vim.o.lines - height) / 2 - 1)
-  local col    = math.floor((vim.o.columns - width) / 2)
+  local title_cmd = (type(M.config.execution.run_command) == "table")
+      and (table.concat(M.config.execution.run_command, " ") .. " " .. vim.fn.fnamemodify(current_file, ":t"))
+      or  (M.config.execution.run_command .. " " .. vim.fn.fnamemodify(current_file, ":t"))
 
-  local term_buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = term_buf })
-  local win = vim.api.nvim_open_win(term_buf, true, {
-    relative="editor", style="minimal", border=opts.border or "rounded",
-    title=(" Run (Kitty): %s "):format(vim.fn.fnamemodify(current_file, ":t")),
-    title_pos="center", width=width, height=height, row=row, col=col, noautocmd=true,
-  })
+  local buf, win, width, height = open_float((" Run: %s "):format(title_cmd), opts)
+  local ns = vim.api.nvim_create_namespace("RunFileWithImages")
+  local ok_hl  = (pcall(vim.api.nvim_get_hl, 0, { name = "DiagnosticOk" }) and "DiagnosticOk") or "DiffAdd"
+  local out_hl, err_hl = "DiagnosticInfo", "DiagnosticWarn"
 
-  -- quick close
-  local chan
-  local function close_win()
-    pcall(vim.fn.jobstop, chan)
-    if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
-  end
-  for _, k in ipairs({ "q", "<Esc>" }) do
-    vim.keymap.set("n", k, close_win, { buffer = term_buf, nowait = true, silent = true })
-  end
+  append(buf, ns, { "▶ Running: " .. title_cmd, "" }, out_hl)
 
-  local function safe_send(c, s)
-    if type(s) ~= "string" or not c or c <= 0 then return end
-    pcall(vim.api.nvim_chan_send, c, s)
-  end
+  local function handle_lines(lines, hl)
+    if not lines then return end
+    for _, line in ipairs(lines) do
+      if type(line) ~= "string" or line == "" then goto continue end
 
-  local function build_shell_line(run_command, file)
-    if type(run_command) == "table" then
-      local parts = {}
-      for _, a in ipairs(run_command) do table.insert(parts, vim.fn.shellescape(a)) end
-      table.insert(parts, vim.fn.shellescape(file))
-      return table.concat(parts, " ")
-    else
-      return run_command .. " " .. vim.fn.shellescape(file)
-    end
-  end
-
-  local warned_no_kitty = false
-  local function icat(path)
-    if vim.fn.executable("kitty") ~= 1 then
-      if not warned_no_kitty then
-        vim.notify("`kitty` CLI not found in $PATH; cannot render images.", vim.log.levels.WARN)
-        warned_no_kitty = true
+      local drew = false
+      -- Find ALL markers in the line (supports multiple)
+      for path in line:gmatch("__NVIM_IMG__:(%S+)") do
+        render_image(buf, win, path, { max_cols = width - 4, max_rows = math.floor(height * 0.6) })
+        drew = true
       end
-      return
-    end
-    -- Fit image inside the float (tweak as you like)
-    local place = ("%dx%d@%dx%d"):format(width, height, 0, 0)
-    local cmd = ("kitty +kitten icat --silent --place %s %s\n")
-      :format(place, vim.fn.shellescape(path))
-    safe_send(chan, cmd)
-  end
 
-  -- Parse stdout/stderr lines, detect markers anywhere in the line
-  local hide_marker = opts.hide_marker ~= false  -- default: hide marker
-  local function handle_data(data)
-    if not data then return end
-    for _, line in ipairs(data) do
-      if type(line) == "string" and line ~= "" then
-        -- find all markers in the line
-        for path in line:gmatch("__NVIM_IMG__:(%S+)") do
-          if vim.fn.filereadable(path) == 1 then
-            if hide_marker then
-              -- clear current line: CR + erase line
-              safe_send(chan, "\r\027[2K")
-            else
-              safe_send(chan, "\n") -- leave a spacer
-            end
-            icat(path)
-          end
-        end
+      -- Hide marker line by default; set opts.show_marker = true to keep it
+      if not drew or opts.show_marker then
+        append(buf, ns, { line }, hl)
       end
+      ::continue::
     end
   end
 
-  chan = vim.fn.termopen(vim.o.shell, {
+  local job_id = vim.fn.jobstart(build_cmd(M.config.execution.run_command, current_file), {
     stdout_buffered = false,
     stderr_buffered = false,
-    on_stdout = function(_, data, _) handle_data(data) end,
-    on_stderr = function(_, data, _) handle_data(data) end, -- just in case marker lands on stderr
-    on_exit   = function(_, code, _)
-      vim.schedule(function()
-        safe_send(chan, ("\n[run] exit %d\n"):format(code or -1))
-        if opts.focus_on_exit == false then pcall(vim.cmd, "noautocmd wincmd p") end
-      end)
+    on_stdout = function(_, data, _) handle_lines(data, out_hl) end,
+    on_stderr = function(_, data, _) handle_lines(data, err_hl) end,
+    on_exit = function(_, code, _)
+      local hl = (code == 0) and ok_hl or "DiagnosticError"
+      append(buf, ns, { "", ("■ Program %s (exit %d)"):format(code == 0 and "completed" or "failed", code) }, hl)
+      if opts.focus_on_exit == false then vim.schedule(function() pcall(vim.cmd, "noautocmd wincmd p") end) end
     end,
   })
-  if chan <= 0 then
-    vim.notify("Failed to start terminal shell.", vim.log.levels.ERROR); return
+
+  if job_id <= 0 then
+    append(buf, ns, { "Failed to start job." }, "DiagnosticError")
+    return
   end
 
-  -- Kick off your python run inside the shell
-  safe_send(chan, build_shell_line(M.config.execution.run_command, current_file) .. "\n")
-  return chan
+  return job_id
 end
+
+return M
 
 
 -- Set up command pickers for integration with UI plugins
