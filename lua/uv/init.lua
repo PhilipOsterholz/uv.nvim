@@ -403,51 +403,144 @@ function M.run_python_function()
 end
 
 -- Run current file
-function M.run_file()
-	local current_file = vim.fn.expand("%:p")
-	if current_file and current_file ~= "" then
-		vim.notify("Running: " .. vim.fn.expand("%:t"), vim.log.levels.INFO)
-		-- Run python on the current file and capture output to notifications
-		vim.fn.jobstart(M.config.execution.run_command .. " " .. vim.fn.shellescape(current_file), {
-			on_stdout = function(_, data)
-				if data and #data > 1 then
-					local output = table.concat(data, "\n")
-					if output and output:match("%S") then
-						vim.notify(output, vim.log.levels.INFO, {
-							title = "Python Output",
-							timeout = M.config.execution.notification_timeout,
-						})
-					end
-				end
-			end,
-			on_stderr = function(_, data)
-				if data and #data > 1 then
-					local output = table.concat(data, "\n")
-					if output and output:match("%S") then
-						vim.notify(output, vim.log.levels.ERROR, {
-							title = "Python Error",
-							timeout = M.config.execution.notification_timeout,
-						})
-					end
-				end
-			end,
-			on_exit = function(_, exit_code)
-				if exit_code == 0 then
-					vim.notify("Program execution completed successfully", vim.log.levels.INFO, {
-						title = "Python Execution",
-					})
-				else
-					vim.notify("Program execution failed with exit code: " .. exit_code, vim.log.levels.ERROR, {
-						title = "Python Execution",
-					})
-				end
-			end,
-			stdout_buffered = true,
-			stderr_buffered = true,
-		})
-	else
-		vim.notify("No file is open", vim.log.levels.WARN)
-	end
+-- Helpers: floating window + streaming appender
+local function _open_float(title, opts)
+  opts = opts or {}
+  local width  = opts.width or math.floor(vim.o.columns * 0.8)
+  local height = opts.height or math.floor(vim.o.lines * 0.6)
+  local row    = math.floor((vim.o.lines - height) / 2 - 1)
+  local col    = math.floor((vim.o.columns - width) / 2)
+
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+  vim.api.nvim_set_option_value("filetype", "log", { buf = buf })
+
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    style = "minimal",
+    border = opts.border or "rounded",
+    title = title,
+    title_pos = "center",
+    width = width,
+    height = height,
+    row = row,
+    col = col,
+    noautocmd = true,
+  })
+
+  vim.api.nvim_set_option_value("wrap", false, { win = win })
+  vim.api.nvim_set_option_value("cursorline", true, { win = win })
+
+  -- quick close
+  for _, k in ipairs({ "q", "<Esc>" }) do
+    vim.keymap.set("n", k, function()
+      if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
+    end, { buffer = buf, nowait = true, silent = true })
+  end
+
+  return buf, win
+end
+
+local function _append(buf, ns, lines, hl)
+  if not lines or #lines == 0 then return end
+  local filtered = {}
+  for _, l in ipairs(lines) do
+    if type(l) == "string" and l ~= "" then table.insert(filtered, l) end
+  end
+  if #filtered == 0 then return end
+
+  local last = vim.api.nvim_buf_line_count(buf)
+  vim.api.nvim_buf_set_lines(buf, last, last, false, filtered)
+
+  if hl then
+    for i = 0, #filtered - 1 do
+      vim.api.nvim_buf_add_highlight(buf, ns, hl, last - 1 + i, 0, -1)
+    end
+  end
+
+  local win = vim.fn.bufwinid(buf)
+  if win ~= -1 then
+    local lc = vim.api.nvim_buf_line_count(buf)
+    vim.api.nvim_win_set_cursor(win, { lc, 0 })
+  end
+end
+
+-- Build jobstart cmd from run_command config + file path
+local function _build_cmd(run_command, file)
+  if type(run_command) == "table" then
+    local cmd = vim.list_extend(vim.deepcopy(run_command), { file })
+    return cmd
+  end
+  -- string: use shell to preserve user’s quoting/aliases
+  return { vim.o.shell, vim.o.shellcmdflag, run_command .. " " .. vim.fn.shellescape(file) }
+end
+
+function M.run_file(opts)
+  opts = opts or {}
+  local current_file = vim.fn.expand("%:p")
+  if not current_file or current_file == "" then
+    vim.notify("No file is open", vim.log.levels.WARN)
+    return
+  end
+  if not M.config or not M.config.execution or not M.config.execution.run_command then
+    vim.notify("Missing M.config.execution.run_command", vim.log.levels.ERROR)
+    return
+  end
+
+  local title_cmd
+  if type(M.config.execution.run_command) == "table" then
+    title_cmd = table.concat(M.config.execution.run_command, " ") .. " " .. vim.fn.fnamemodify(current_file, ":t")
+  else
+    title_cmd = M.config.execution.run_command .. " " .. vim.fn.fnamemodify(current_file, ":t")
+  end
+  local title = (" Run: %s "):format(title_cmd:sub(1, 90) .. (#title_cmd > 90 and " …" or ""))
+
+  local buf = _open_float(title, opts)
+  buf = select(1, buf) -- keep buffer id
+
+  local ns = vim.api.nvim_create_namespace("RunFileFloat")
+  local ok_hl   = (pcall(vim.api.nvim_get_hl, 0, { name = "DiagnosticOk" }) and "DiagnosticOk") or "DiffAdd"
+  local out_hl  = "DiagnosticInfo"
+  local err_hl  = "DiagnosticWarn"
+  local exit_hl = "DiagnosticError"
+
+  _append(buf, ns, { "▶ Running: " .. title_cmd, "" }, out_hl)
+
+  local cmd = _build_cmd(M.config.execution.run_command, current_file)
+  local timeout = M.config.execution.notification_timeout -- just reused if you want later
+
+  local job_id = vim.fn.jobstart(cmd, {
+    stdout_buffered = false,
+    stderr_buffered = false,
+    on_stdout = function(_, data)
+      _append(buf, ns, data, out_hl)
+    end,
+    on_stderr = function(_, data)
+      _append(buf, ns, data, err_hl)
+    end,
+    on_exit = function(_, code)
+      local msg
+      local hl
+      if code == 0 then
+        msg, hl = (""), ok_hl
+        _append(buf, ns, { "", "■ Program execution completed successfully (exit 0)" }, hl)
+      else
+        msg, hl = ("Program execution failed with exit code: " .. code), exit_hl
+        _append(buf, ns, { "", "■ " .. msg }, hl)
+      end
+      -- Optional: focus back to previous window when done
+      if opts.focus_on_exit == false then
+        vim.schedule(function() pcall(vim.cmd, "noautocmd wincmd p") end)
+      end
+    end,
+  })
+
+  if job_id <= 0 then
+    _append(buf, ns, { "Failed to start job." }, exit_hl)
+    return
+  end
+
+  return job_id
 end
 
 -- Set up command pickers for integration with UI plugins
