@@ -544,25 +544,18 @@ function M.run_file_tmp(opts)
 end
 
 function M.run_file(opts)
-  -- Float a terminal running your shell, run the current file, and
--- inline-display "__NVIM_IMG__:/path.png" with Kitty's icat.
-  opts = opts or {}
-  if not vim.env.KITTY_PID and not (vim.env.TERM or ""):match("kitty") then
-    vim.notify("Not running inside Kitty; icat won't work here.", vim.log.levels.ERROR)
-    return
-  end
-  if not (M.config and M.config.execution and M.config.execution.run_command) then
-    vim.notify("Missing M.config.execution.run_command", vim.log.levels.ERROR)
-    return
-  end
-
+ opts = opts or {}
   local current_file = vim.fn.expand("%:p")
   if current_file == "" then
-    vim.notify("No file is open", vim.log.levels.WARN)
-    return
+    vim.notify("No file is open", vim.log.levels.WARN); return
+  end
+  if not (M.config and M.config.execution and M.config.execution.run_command) then
+    vim.notify("Missing M.config.execution.run_command", vim.log.levels.ERROR); return
+  end
+  if not (vim.env.KITTY_PID or (vim.env.TERM or ""):match("kitty")) then
+    vim.notify("Not running inside Kitty; image rendering won’t work.", vim.log.levels.ERROR); return
   end
 
-  -- ---------- floating terminal ----------
   local width  = opts.width  or math.floor(vim.o.columns * 0.8)
   local height = opts.height or math.floor(vim.o.lines   * 0.6)
   local row    = math.floor((vim.o.lines - height) / 2 - 1)
@@ -570,18 +563,14 @@ function M.run_file(opts)
 
   local term_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = term_buf })
-
   local win = vim.api.nvim_open_win(term_buf, true, {
-    relative = "editor",
-    style    = "minimal",
-    border   = opts.border or "rounded",
-    title    = (" Run (Kitty): %s "):format(vim.fn.fnamemodify(current_file, ":t")),
-    title_pos= "center",
-    width = width, height = height, row = row, col = col, noautocmd = true,
+    relative="editor", style="minimal", border=opts.border or "rounded",
+    title=(" Run (Kitty): %s "):format(vim.fn.fnamemodify(current_file, ":t")),
+    title_pos="center", width=width, height=height, row=row, col=col, noautocmd=true,
   })
 
-  -- quick close (also stop the shell)
-  local chan -- forward-declared
+  -- quick close
+  local chan
   local function close_win()
     pcall(vim.fn.jobstop, chan)
     if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
@@ -590,13 +579,11 @@ function M.run_file(opts)
     vim.keymap.set("n", k, close_win, { buffer = term_buf, nowait = true, silent = true })
   end
 
-  -- safe send helper (prevents E474 on closed/invalid channels)
-  local function safe_send(c, data)
-    if type(data) ~= "string" or not c or c <= 0 then return end
-    pcall(vim.api.nvim_chan_send, c, data)
+  local function safe_send(c, s)
+    if type(s) ~= "string" or not c or c <= 0 then return end
+    pcall(vim.api.nvim_chan_send, c, s)
   end
 
-  -- build the *shell* command line for your runner
   local function build_shell_line(run_command, file)
     if type(run_command) == "table" then
       local parts = {}
@@ -608,45 +595,62 @@ function M.run_file(opts)
     end
   end
 
-  -- Start an interactive shell; we'll send commands to it.
+  local warned_no_kitty = false
+  local function icat(path)
+    if vim.fn.executable("kitty") ~= 1 then
+      if not warned_no_kitty then
+        vim.notify("`kitty` CLI not found in $PATH; cannot render images.", vim.log.levels.WARN)
+        warned_no_kitty = true
+      end
+      return
+    end
+    -- Fit image inside the float (tweak as you like)
+    local place = ("%dx%d@%dx%d"):format(width, height, 0, 0)
+    local cmd = ("kitty +kitten icat --silent --place %s %s\n")
+      :format(place, vim.fn.shellescape(path))
+    safe_send(chan, cmd)
+  end
+
+  -- Parse stdout/stderr lines, detect markers anywhere in the line
+  local hide_marker = opts.hide_marker ~= false  -- default: hide marker
+  local function handle_data(data)
+    if not data then return end
+    for _, line in ipairs(data) do
+      if type(line) == "string" and line ~= "" then
+        -- find all markers in the line
+        for path in line:gmatch("__NVIM_IMG__:(%S+)") do
+          if vim.fn.filereadable(path) == 1 then
+            if hide_marker then
+              -- clear current line: CR + erase line
+              safe_send(chan, "\r\027[2K")
+            else
+              safe_send(chan, "\n") -- leave a spacer
+            end
+            icat(path)
+          end
+        end
+      end
+    end
+  end
+
   chan = vim.fn.termopen(vim.o.shell, {
     stdout_buffered = false,
     stderr_buffered = false,
-
-    on_stdout = function(_, data, _)
-      if not data then return end
-      for _, line in ipairs(data) do
-        if type(line) ~= "string" or line == "" then goto continue end
-        local path = line:match("^__NVIM_IMG__:(.+)$")
-        if path and vim.fn.filereadable(path) == 1 then
-          -- Full-window placement (content size == width x height)
-          local place = ("%dx%d@%dx%d"):format(width, height, 0, 0)
-          local cmd = ("kitty +kitten icat --silent --place %s %s\n")
-            :format(place, vim.fn.fnameescape(path))
-          safe_send(chan, "\n")      -- visual spacing
-          safe_send(chan, cmd)       -- draw image
-        end
-        ::continue::
-      end
-    end,
-
-    on_exit = function(_, code, _)
+    on_stdout = function(_, data, _) handle_data(data) end,
+    on_stderr = function(_, data, _) handle_data(data) end, -- just in case marker lands on stderr
+    on_exit   = function(_, code, _)
       vim.schedule(function()
-        safe_send(chan, ("\n[%s] exit %d\n"):format("run", code or -1))
+        safe_send(chan, ("\n[run] exit %d\n"):format(code or -1))
         if opts.focus_on_exit == false then pcall(vim.cmd, "noautocmd wincmd p") end
       end)
     end,
   })
-
   if chan <= 0 then
-    vim.notify("Failed to start terminal shell.", vim.log.levels.ERROR)
-    return
+    vim.notify("Failed to start terminal shell.", vim.log.levels.ERROR); return
   end
 
-  -- kick off the python run *in the shell*
-  local run_line = build_shell_line(M.config.execution.run_command, current_file) .. "\n"
-  safe_send(chan, run_line)
-
+  -- Kick off your python run inside the shell
+  safe_send(chan, build_shell_line(M.config.execution.run_command, current_file) .. "\n")
   return chan
 end
 
