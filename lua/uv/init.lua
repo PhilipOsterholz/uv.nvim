@@ -475,7 +475,7 @@ local function _build_cmd(run_command, file)
   return { vim.o.shell, vim.o.shellcmdflag, run_command .. " " .. vim.fn.shellescape(file) }
 end
 
-function M.run_file(opts)
+function M.run_file_tmp(opts)
   opts = opts or {}
   local current_file = vim.fn.expand("%:p")
   if not current_file or current_file == "" then
@@ -541,6 +541,96 @@ function M.run_file(opts)
   end
 
   return job_id
+end
+
+function M.run_file(opts)
+  opts = opts or {}
+  local current_file = vim.fn.expand("%:p")
+  if not current_file or current_file == "" then
+    vim.notify("No file is open", vim.log.levels.WARN); return
+  end
+  if not (M.config and M.config.execution and M.config.execution.run_command) then
+    vim.notify("Missing M.config.execution.run_command", vim.log.levels.ERROR); return
+  end
+
+  -- --- open floating *terminal* window ---
+  local width  = opts.width  or math.floor(vim.o.columns * 0.8)
+  local height = opts.height or math.floor(vim.o.lines   * 0.6)
+  local row    = math.floor((vim.o.lines - height) / 2 - 1)
+  local col    = math.floor((vim.o.columns - width) / 2)
+
+  local term_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = term_buf })
+  local win = vim.api.nvim_open_win(term_buf, true, {
+    relative = "editor",
+    style = "minimal",
+    border = opts.border or "rounded",
+    title = (" Run (Kitty): %s "):format(vim.fn.fnamemodify(current_file, ":t")),
+    title_pos = "center",
+    width = width, height = height, row = row, col = col, noautocmd = true,
+  })
+  vim.api.nvim_set_option_value("winblend", opts.winblend or 0, { win = win })
+
+  -- quick close
+  for _, k in ipairs({ "q", "<Esc>" }) do
+    vim.keymap.set("n", k, function()
+      if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
+    end, { buffer = term_buf, nowait = true, silent = true })
+  end
+
+  -- build the command (supports string or list in your config)
+  local function build_cmd(run_command, file)
+    if type(run_command) == "table" then
+      local cmd = vim.list_extend(vim.deepcopy(run_command), { file })
+      return cmd
+    end
+    -- use shell so user strings like "poetry run python -u" work
+    return { vim.o.shell, vim.o.shellcmdflag, run_command .. " " .. vim.fn.shellescape(file) }
+  end
+
+  -- start a shell in terminal
+  local chan = vim.fn.termopen(build_cmd(M.config.execution.run_command, current_file), {
+    stdout_buffered = false,
+    stderr_buffered = false,
+
+    on_stdout = function(_, data, _)
+      if not data then return end
+      for _, line in ipairs(data) do
+        if type(line) == "string" and line ~= "" then
+          local path = line:match("^__NVIM_IMG__:(.+)$")
+          if path and vim.fn.filereadable(path) == 1 then
+            -- Calculate placement in terminal cells (full window).
+            -- Kitty wants COLSxROWS@XxY (cells). We’ll use 0,0 origin.
+            local place = ("%dx%d@%dx%d"):format(width - 2, height - 2, 0, 0)
+            -- Clear some space and render image to the float
+            vim.fn.chansend(chan, "\n")  -- new line before image (optional)
+            local cmd = ("kitty +kitten icat --place %s %s\n"):format(place, vim.fn.fnameescape(path))
+            vim.fn.chansend(chan, cmd)
+          end
+        end
+      end
+    end,
+
+    on_stderr = function(_, _data, _) -- let stderr just print in the terminal
+    end,
+
+    on_exit = function(_, code, _)
+      local msg = (code == 0) and "Execution completed (exit 0)" or ("Execution failed (exit " .. code .. ")")
+      vim.schedule(function()
+        if vim.api.nvim_buf_is_valid(term_buf) then
+          vim.fn.chansend(chan, "\n" .. msg .. "\n")
+        end
+        if opts.focus_on_exit == false then pcall(vim.cmd, "noautocmd wincmd p") end
+      end)
+    end,
+  })
+
+  if chan <= 0 then
+    vim.notify("Failed to start terminal job.", vim.log.levels.ERROR)
+    return
+  end
+
+  return chan
 end
 
 -- Set up command pickers for integration with UI plugins
