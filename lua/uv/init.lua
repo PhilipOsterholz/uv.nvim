@@ -544,16 +544,25 @@ function M.run_file_tmp(opts)
 end
 
 function M.run_file(opts)
+  -- Float a terminal running your shell, run the current file, and
+-- inline-display "__NVIM_IMG__:/path.png" with Kitty's icat.
   opts = opts or {}
-  local current_file = vim.fn.expand("%:p")
-  if not current_file or current_file == "" then
-    vim.notify("No file is open", vim.log.levels.WARN); return
+  if not vim.env.KITTY_PID and not (vim.env.TERM or ""):match("kitty") then
+    vim.notify("Not running inside Kitty; icat won't work here.", vim.log.levels.ERROR)
+    return
   end
   if not (M.config and M.config.execution and M.config.execution.run_command) then
-    vim.notify("Missing M.config.execution.run_command", vim.log.levels.ERROR); return
+    vim.notify("Missing M.config.execution.run_command", vim.log.levels.ERROR)
+    return
   end
 
-  -- --- open floating *terminal* window ---
+  local current_file = vim.fn.expand("%:p")
+  if current_file == "" then
+    vim.notify("No file is open", vim.log.levels.WARN)
+    return
+  end
+
+  -- ---------- floating terminal ----------
   local width  = opts.width  or math.floor(vim.o.columns * 0.8)
   local height = opts.height or math.floor(vim.o.lines   * 0.6)
   local row    = math.floor((vim.o.lines - height) / 2 - 1)
@@ -561,77 +570,86 @@ function M.run_file(opts)
 
   local term_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = term_buf })
+
   local win = vim.api.nvim_open_win(term_buf, true, {
     relative = "editor",
-    style = "minimal",
-    border = opts.border or "rounded",
-    title = (" Run (Kitty): %s "):format(vim.fn.fnamemodify(current_file, ":t")),
-    title_pos = "center",
+    style    = "minimal",
+    border   = opts.border or "rounded",
+    title    = (" Run (Kitty): %s "):format(vim.fn.fnamemodify(current_file, ":t")),
+    title_pos= "center",
     width = width, height = height, row = row, col = col, noautocmd = true,
   })
-  vim.api.nvim_set_option_value("winblend", opts.winblend or 0, { win = win })
 
-  -- quick close
+  -- quick close (also stop the shell)
+  local chan -- forward-declared
+  local function close_win()
+    pcall(vim.fn.jobstop, chan)
+    if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
+  end
   for _, k in ipairs({ "q", "<Esc>" }) do
-    vim.keymap.set("n", k, function()
-      if vim.api.nvim_win_is_valid(win) then vim.api.nvim_win_close(win, true) end
-    end, { buffer = term_buf, nowait = true, silent = true })
+    vim.keymap.set("n", k, close_win, { buffer = term_buf, nowait = true, silent = true })
   end
 
-  -- build the command (supports string or list in your config)
-  local function build_cmd(run_command, file)
+  -- safe send helper (prevents E474 on closed/invalid channels)
+  local function safe_send(c, data)
+    if type(data) ~= "string" or not c or c <= 0 then return end
+    pcall(vim.api.nvim_chan_send, c, data)
+  end
+
+  -- build the *shell* command line for your runner
+  local function build_shell_line(run_command, file)
     if type(run_command) == "table" then
-      local cmd = vim.list_extend(vim.deepcopy(run_command), { file })
-      return cmd
+      local parts = {}
+      for _, a in ipairs(run_command) do table.insert(parts, vim.fn.shellescape(a)) end
+      table.insert(parts, vim.fn.shellescape(file))
+      return table.concat(parts, " ")
+    else
+      return run_command .. " " .. vim.fn.shellescape(file)
     end
-    -- use shell so user strings like "poetry run python -u" work
-    return { vim.o.shell, vim.o.shellcmdflag, run_command .. " " .. vim.fn.shellescape(file) }
   end
 
-  -- start a shell in terminal
-  local chan = vim.fn.termopen(build_cmd(M.config.execution.run_command, current_file), {
+  -- Start an interactive shell; we'll send commands to it.
+  chan = vim.fn.termopen(vim.o.shell, {
     stdout_buffered = false,
     stderr_buffered = false,
 
     on_stdout = function(_, data, _)
       if not data then return end
       for _, line in ipairs(data) do
-        if type(line) == "string" and line ~= "" then
-          local path = line:match("^__NVIM_IMG__:(.+)$")
-          if path and vim.fn.filereadable(path) == 1 then
-            -- Calculate placement in terminal cells (full window).
-            -- Kitty wants COLSxROWS@XxY (cells). We’ll use 0,0 origin.
-            local place = ("%dx%d@%dx%d"):format(width - 2, height - 2, 0, 0)
-            -- Clear some space and render image to the float
-            vim.fn.chansend(chan, "\n")  -- new line before image (optional)
-            local cmd = ("kitty +kitten icat --place %s %s\n"):format(place, vim.fn.fnameescape(path))
-            vim.fn.chansend(chan, cmd)
-          end
+        if type(line) ~= "string" or line == "" then goto continue end
+        local path = line:match("^__NVIM_IMG__:(.+)$")
+        if path and vim.fn.filereadable(path) == 1 then
+          -- Full-window placement (content size == width x height)
+          local place = ("%dx%d@%dx%d"):format(width, height, 0, 0)
+          local cmd = ("kitty +kitten icat --silent --place %s %s\n")
+            :format(place, vim.fn.fnameescape(path))
+          safe_send(chan, "\n")      -- visual spacing
+          safe_send(chan, cmd)       -- draw image
         end
+        ::continue::
       end
     end,
 
-    on_stderr = function(_, _data, _) -- let stderr just print in the terminal
-    end,
-
     on_exit = function(_, code, _)
-      local msg = (code == 0) and "Execution completed (exit 0)" or ("Execution failed (exit " .. code .. ")")
       vim.schedule(function()
-        if vim.api.nvim_buf_is_valid(term_buf) then
-          vim.fn.chansend(chan, "\n" .. msg .. "\n")
-        end
+        safe_send(chan, ("\n[%s] exit %d\n"):format("run", code or -1))
         if opts.focus_on_exit == false then pcall(vim.cmd, "noautocmd wincmd p") end
       end)
     end,
   })
 
   if chan <= 0 then
-    vim.notify("Failed to start terminal job.", vim.log.levels.ERROR)
+    vim.notify("Failed to start terminal shell.", vim.log.levels.ERROR)
     return
   end
 
+  -- kick off the python run *in the shell*
+  local run_line = build_shell_line(M.config.execution.run_command, current_file) .. "\n"
+  safe_send(chan, run_line)
+
   return chan
 end
+
 
 -- Set up command pickers for integration with UI plugins
 function M.setup_pickers()
