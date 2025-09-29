@@ -409,6 +409,7 @@ function M.run_file()
 		vim.notify("Running: " .. vim.fn.expand("%:t"), vim.log.levels.INFO)
 		-- Run python on the current file and capture output to notifications
 		vim.fn.jobstart(M.config.execution.run_command .. " " .. vim.fn.shellescape(current_file), {
+			stdout_buffered=false,
 			on_stdout = function(_, data)
 				if data and #data > 1 then
 					local output = table.concat(data, "\n")
