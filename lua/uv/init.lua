@@ -34,7 +34,7 @@ M.config = {
 	-- Execution options
 	execution = {
 		-- Python run command template
-		run_command = "uv run python",
+		run_command = "uv run",
 
 		-- Show output in notifications
 		notify_output = true,
